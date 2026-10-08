@@ -1,0 +1,1043 @@
+
+/**
+ * ICT-Reverse Style Backtester - Strategy v2
+ *
+ * RULES INTEGRATED
+ *
+ * DAILY S/R
+ * - Maximum 2-year lookback
+ * - Minimum 5 separate confirmed rejection visits
+ * - Minimum 6-day separation between rejection visits
+ * - Pass-through does NOT disqualify a zone
+ * - NASDAQ significant rejection = 650+ points
+ * - US30 significant rejection = 1,000+ points
+ * - Maximum S/R zone width:
+ *      NASDAQ = 30 points
+ *      US30   = 50 points
+ * - A line uses the exact line price.
+ * - A zone uses its 50% midpoint for entry.
+ *
+ * 1H MARKET STRUCTURE
+ * - Clear trend required.
+ * - Choppy/range conditions are ignored.
+ * - Bullish = HH + HL structure.
+ * - Bearish = LL + LH structure.
+ * - Confirmed swings only; no future candles may be used.
+ *
+ * FIBONACCI
+ * - Bullish = most recent HL -> HH
+ * - Bearish = most recent LH -> LL
+ *
+ * SETUP A
+ * - Daily S/R is in the appropriate H1 premium/discount area.
+ * - Entry occurs when price touches the predefined S/R entry price.
+ * - No confirmation candle.
+ *
+ * SETUP B
+ * - Price has moved from a Daily S/R.
+ * - No qualifying Daily S/R exists in the Setup-A target area.
+ * - MSS occurs.
+ * - Bullish: 2 successive HH + HL.
+ * - Bearish: 2 successive LL + LH.
+ * - Entry at 0.5 Fib.
+ * - No confirmation candle.
+ *
+ * EXECUTION
+ * - Entry occurs intrabar.
+ * - If price gaps beyond the entry without touching it, trade is forfeited.
+ * - Same candle hitting SL and TP = SL first.
+ *
+ * RISK
+ * - Starting capital = $10,000
+ * - Fixed $100 risk per trade.
+ * - NO compounding.
+ * - SL = 200 points.
+ * - TP = 600 points.
+ * - RR = 1:3.
+ *
+ * MULTIPLE TRADES
+ * - Maximum one open trade per asset.
+ * - NASDAQ and US30 may have simultaneous trades.
+ *
+ * NEWS
+ * - CPI, FOMC and NFP only.
+ * - No new entries 30 minutes before or after release.
+ * - NEWS_EVENTS below must contain verified UTC release times.
+ *
+ * NO TIME FILTER
+ * - No 8am-7pm restriction.
+ * - No whole-day holiday filter.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { parse } = require('csv-parse/sync');
+
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const START_DATE = '2023-01-01T00:00:00Z';
+const END_DATE   = '2026-09-30T23:59:59Z';
+
+const INITIAL_CAPITAL = 10000;
+
+// FIXED RISK — DOES NOT COMPOUND
+const FIXED_RISK_USD = 100;
+
+// STRATEGY EXITS
+const STOP_POINTS = 200;
+const TAKE_PROFIT_POINTS = 600;
+
+const RR = TAKE_PROFIT_POINTS / STOP_POINTS;
+
+
+// ============================================================
+// DAILY S/R SETTINGS
+// ============================================================
+
+const DAILY_LOOKBACK_DAYS = 730; // Maximum 2 years
+const MIN_REJECTIONS = 5;
+const MAX_ZONE_WIDTH_RATIO = 0.10;
+
+
+// ============================================================
+// SWING SETTINGS
+// ============================================================
+
+const H1_SWING_LEFT = 2;
+const H1_SWING_RIGHT = 2;
+
+const DAILY_SWING_LEFT = 1;
+const DAILY_SWING_RIGHT = 1;
+
+
+// ============================================================
+// POSITION SIZE
+// ============================================================
+
+const USD_PER_INDEX_POINT_PER_CONTRACT = 1;
+const RISK_PER_CONTRACT = STOP_POINTS * USD_PER_INDEX_POINT_PER_CONTRACT;
+
+
+// ============================================================
+// INSTRUMENTS
+// ============================================================
+
+const INSTRUMENTS = [
+  'NASDAQ',
+  'US30'
+];
+
+const INSTRUMENT_RULES = {
+  NASDAQ: {
+    significantMove: 650,
+    maxZoneWidth: 30,          // ← Updated
+    label: 'NASDAQ / US 100 Tech'
+  },
+  US30: {
+    significantMove: 1000,
+    maxZoneWidth: 50,          // ← Updated
+    label: 'US30 / US 30 Index'
+  }
+};
+
+
+// ============================================================
+// NEWS EVENTS
+// ============================================================
+
+const NEWS_EVENTS = [
+  // { name: 'CPI', t: '2026-01-13T13:30:00Z' },
+  // { name: 'NFP', t: '2026-01-09T13:30:00Z' },
+  // { name: 'FOMC', t: '2026-01-28T19:00:00Z' },
+];
+
+
+function isMajorNewsWindow(timestamp) {
+  const halfHour = 30 * 60 * 1000;
+  return NEWS_EVENTS.some(event => {
+    const eventTime = typeof event.t === 'number' ? event.t : new Date(event.t).getTime();
+    if (!Number.isFinite(eventTime)) return false;
+    return Math.abs(timestamp - eventTime) <= halfHour;
+  });
+}
+
+
+// ============================================================
+// LOAD CSV
+// ============================================================
+
+function loadCSV(filePath) {
+  if (!fs.existsSync(filePath)) {
+    console.error(`\n❌ File not found: ${filePath}`);
+    process.exit(1);
+  }
+
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const records = parse(raw, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true
+  });
+
+  return records
+    .map(r => ({
+      t: new Date(r.timestamp || r.date || r.time).getTime(),
+      o: parseFloat(r.open),
+      h: parseFloat(r.high),
+      l: parseFloat(r.low),
+      c: parseFloat(r.close),
+      v: parseFloat(r.volume || 0)
+    }))
+    .filter(b =>
+      Number.isFinite(b.t) &&
+      Number.isFinite(b.o) &&
+      Number.isFinite(b.h) &&
+      Number.isFinite(b.l) &&
+      Number.isFinite(b.c)
+    )
+    .sort((a, b) => a.t - b.t);
+}
+
+
+// ============================================================
+// UTC DAY
+// ============================================================
+
+function utcDayStart(timestamp) {
+  const d = new Date(timestamp);
+  d.setUTCHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+
+// ============================================================
+// SWING DETECTION
+// ============================================================
+
+function findSwings(bars, left = 2, right = 2, maxIndex = bars.length - 1) {
+  const swings = [];
+  const limit = Math.min(bars.length - right - 1, maxIndex - right);
+
+  for (let i = left; i <= limit; i++) {
+    let isHigh = true;
+    let isLow = true;
+
+    for (let j = i - left; j <= i + right; j++) {
+      if (j === i) continue;
+      if (bars[j].h >= bars[i].h) isHigh = false;
+      if (bars[j].l <= bars[i].l) isLow = false;
+    }
+
+    if (isHigh) {
+      swings.push({ index: i, price: bars[i].h, type: 'high', t: bars[i].t });
+    }
+    if (isLow) {
+      swings.push({ index: i, price: bars[i].l, type: 'low', t: bars[i].t });
+    }
+  }
+
+  return swings.sort((a, b) => a.index - b.index);
+}
+
+
+// ============================================================
+// MARKET STRUCTURE
+// ============================================================
+
+function getMarketStructure(swings) {
+  if (!swings || swings.length < 6) return 'range';
+
+  const recent = swings.slice(-12);
+  const highs = recent.filter(s => s.type === 'high');
+  const lows  = recent.filter(s => s.type === 'low');
+
+  if (highs.length < 3 || lows.length < 3) return 'range';
+
+  const h1 = highs[highs.length - 3].price;
+  const h2 = highs[highs.length - 2].price;
+  const h3 = highs[highs.length - 1].price;
+
+  const l1 = lows[lows.length - 3].price;
+  const l2 = lows[lows.length - 2].price;
+  const l3 = lows[lows.length - 1].price;
+
+  const bullish = h3 > h2 && h2 > h1 && l3 > l2 && l2 > l1;
+  const bearish = l3 < l2 && l2 < l1 && h3 < h2 && h2 < h1;
+
+  if (bullish && !bearish) return 'up';
+  if (bearish && !bullish) return 'down';
+  return 'range';
+}
+
+
+// ============================================================
+// CONFIRMED H1 SWINGS
+// ============================================================
+
+function getConfirmedH1Swings(h1All, h1Index) {
+  return findSwings(h1All, H1_SWING_LEFT, H1_SWING_RIGHT, h1Index);
+}
+
+
+// ============================================================
+// FIBONACCI
+// ============================================================
+
+function getFibonacci(swings, structure) {
+  if (!swings || swings.length < 4) return null;
+
+  const highs = swings.filter(s => s.type === 'high');
+  const lows  = swings.filter(s => s.type === 'low');
+
+  if (structure === 'up') {
+    if (lows.length < 1 || highs.length < 1) return null;
+
+    const hl = lows[lows.length - 1];
+    const hhCandidates = highs.filter(h => h.index > hl.index);
+    if (hhCandidates.length === 0) return null;
+
+    const hh = hhCandidates[hhCandidates.length - 1];
+    if (hh.price <= hl.price) return null;
+
+    const half = hl.price + (hh.price - hl.price) * 0.5;
+
+    return {
+      zero: hl.price,
+      half,
+      one: hh.price,
+      direction: 'up',
+      startSwing: hl,
+      endSwing: hh
+    };
+  }
+
+  if (structure === 'down') {
+    if (highs.length < 1 || lows.length < 1) return null;
+
+    const lh = highs[highs.length - 1];
+    const llCandidates = lows.filter(l => l.index > lh.index);
+    if (llCandidates.length === 0) return null;
+
+    const ll = llCandidates[llCandidates.length - 1];
+    if (ll.price >= lh.price) return null;
+
+    const half = lh.price - (lh.price - ll.price) * 0.5;
+
+    return {
+      zero: lh.price,
+      half,
+      one: ll.price,
+      direction: 'down',
+      startSwing: lh,
+      endSwing: ll
+    };
+  }
+
+  return null;
+}
+
+
+// ============================================================
+// PREMIUM / DISCOUNT
+// ============================================================
+
+function getPremiumDiscountRange(fib, structure) {
+  if (structure === 'up') {
+    return { low: fib.half, high: fib.one, name: 'premium' };
+  }
+  return { low: fib.one, high: fib.half, name: 'discount' };
+}
+
+
+// ============================================================
+// ENTRY TOUCH + GAP CHECK
+// ============================================================
+
+function priceTouchesEntry(bar, entry, side) {
+  if (side === 'long') return bar.l <= entry && bar.h >= entry;
+  return bar.h >= entry && bar.l <= entry;
+}
+
+function isGapPastEntry(bar, entry, side) {
+  if (side === 'long') return bar.o > entry && bar.l > entry;
+  return bar.o < entry && bar.h < entry;
+}
+
+
+// ============================================================
+// POSITION SIZE + CREATE POSITION
+// ============================================================
+
+function calculatePositionSize() {
+  return FIXED_RISK_USD / RISK_PER_CONTRACT;
+}
+
+function makePosition({ side, entry, srZone, setup, structure, fib, entryTime }) {
+  const sl = side === 'long' ? entry - STOP_POINTS : entry + STOP_POINTS;
+  const tp = side === 'long' ? entry + TAKE_PROFIT_POINTS : entry - TAKE_PROFIT_POINTS;
+
+  return {
+    side,
+    entry,
+    sl,
+    tp,
+    size: calculatePositionSize(),
+    riskUsd: FIXED_RISK_USD,
+    srZone,
+    setup,
+    structure,
+    fibHalf: fib ? fib.half : null,
+    entryTime
+  };
+}
+
+
+// ============================================================
+// DAILY REJECTION ENGINE
+// ============================================================
+
+function buildDailyRejectionEvents(d1Bars, rules) {
+  if (d1Bars.length < 20) return [];
+
+  const swings = findSwings(d1Bars, DAILY_SWING_LEFT, DAILY_SWING_RIGHT, d1Bars.length - 1);
+  const anchors = swings.map(s => ({ price: s.price, index: s.index, type: s.type }));
+  const events = [];
+
+  for (const anchor of anchors) {
+    const zoneHalf = rules.maxZoneWidth / 2;
+    const zoneLow  = anchor.price - zoneHalf;
+    const zoneHigh = anchor.price + zoneHalf;
+
+    let activeVisit = null;
+
+    for (let i = anchor.index + 1; i < d1Bars.length; i++) {
+      const bar = d1Bars[i];
+      const intersects = bar.h >= zoneLow && bar.l <= zoneHigh;
+
+      if (intersects && !activeVisit) {
+        activeVisit = {
+          startIndex: i,
+          lastIndex: i,
+          zoneLow,
+          zoneHigh,
+          highestHigh: bar.h,
+          lowestLow: bar.l,
+          passedThrough: false
+        };
+        continue;
+      }
+
+      if (activeVisit) {
+        if (intersects) {
+          activeVisit.lastIndex = i;
+          activeVisit.highestHigh = Math.max(activeVisit.highestHigh, bar.h);
+          activeVisit.lowestLow  = Math.min(activeVisit.lowestLow, bar.l);
+          if (bar.h > zoneHigh && bar.l < zoneLow) activeVisit.passedThrough = true;
+          continue;
+        }
+
+        const moveUp = (bar.h - activeVisit.lowestLow) >= rules.significantMove;
+        const moveDown = (activeVisit.highestHigh - bar.l) >= rules.significantMove;
+
+        if (moveUp || moveDown) {
+          const rejectionDirection = moveUp ? 'up' : 'down';
+          const wickPrice = rejectionDirection === 'up' ? activeVisit.lowestLow : activeVisit.highestHigh;
+
+          events.push({
+            anchorPrice: anchor.price,
+            wickPrice,
+            startIndex: activeVisit.startIndex,
+            confirmationIndex: i,
+            startTime: d1Bars[activeVisit.startIndex].t,
+            confirmationTime: bar.t,
+            direction: rejectionDirection,
+            passedThrough: activeVisit.passedThrough
+          });
+        }
+
+        activeVisit = null;
+      }
+    }
+  }
+
+  return events;
+}
+
+
+// ============================================================
+// GROUP DAILY REJECTION EVENTS INTO ZONES
+// ============================================================
+
+function buildDailyZonesAtTime(d1Bars, asOfTime, rules) {
+  const lookbackStart = asOfTime - DAILY_LOOKBACK_DAYS * 24 * 60 * 60 * 1000;
+  const usableBars = d1Bars.filter(b => b.t >= lookbackStart && b.t <= asOfTime);
+
+  if (usableBars.length < 20) return [];
+
+  const events = buildDailyRejectionEvents(usableBars, rules);
+  const confirmedEvents = events.filter(e => e.confirmationTime <= asOfTime);
+
+  if (confirmedEvents.length < MIN_REJECTIONS) return [];
+
+  const zones = [];
+
+  for (const event of confirmedEvents) {
+    let placed = false;
+
+    for (const zone of zones) {
+      const proposedLow  = Math.min(zone.low, event.wickPrice);
+      const proposedHigh = Math.max(zone.high, event.wickPrice);
+      const proposedWidth = proposedHigh - proposedLow;
+
+      if (proposedWidth <= rules.maxZoneWidth) {
+        zone.events.push(event);
+        zone.low = proposedLow;
+        zone.high = proposedHigh;
+        zone.midpoint = (proposedLow + proposedHigh) / 2;
+        placed = true;
+        break;
+      }
+    }
+
+    if (!placed) {
+      zones.push({
+        low: event.wickPrice,
+        high: event.wickPrice,
+        midpoint: event.wickPrice,
+        events: [event]
+      });
+    }
+  }
+
+  // Minimum 6-day separation
+  const MIN_SEPARATION_MS = 6 * 24 * 60 * 60 * 1000;
+
+  const qualifying = zones.filter(zone => {
+    const sortedEvents = [...zone.events].sort((a, b) => a.confirmationTime - b.confirmationTime);
+
+    let validVisits = 0;
+    let lastValidTime = -Infinity;
+
+    for (const event of sortedEvents) {
+      if (event.confirmationTime - lastValidTime >= MIN_SEPARATION_MS) {
+        validVisits++;
+        lastValidTime = event.confirmationTime;
+      }
+    }
+
+    return validVisits >= MIN_REJECTIONS;
+  });
+
+  return qualifying.map(zone => ({
+    ...zone,
+    rejectionCount: zone.events.length,
+    width: zone.high - zone.low,
+    type: zone.low === zone.high ? 'line' : 'zone'
+  }));
+}
+
+
+// ============================================================
+// GET ACTIVE DAILY S/R ZONES
+// ============================================================
+
+function getActiveDailySRZones(d1Bars, asOfTime, rules) {
+  return buildDailyZonesAtTime(d1Bars, asOfTime, rules);
+}
+
+
+// ============================================================
+// TARGET ZONE + NEAREST S/R
+// ============================================================
+
+function getQualifyingSRInTargetZone(zones, fib, structure) {
+  if (!fib) return [];
+  const pd = getPremiumDiscountRange(fib, structure);
+  return zones.filter(zone => zone.midpoint >= pd.low && zone.midpoint <= pd.high);
+}
+
+function findNearestQualifyingSR(zones, currentPrice, bar, fib, structure) {
+  const candidates = getQualifyingSRInTargetZone(zones, fib, structure);
+  if (candidates.length === 0) return null;
+
+  const side = structure === 'up' ? 'long' : 'short';
+
+  const approached = candidates.filter(zone => {
+    const entry = zone.midpoint;
+    if (isGapPastEntry(bar, entry, side)) return false;
+    return priceTouchesEntry(bar, entry, side);
+  });
+
+  if (approached.length === 0) return null;
+
+  approached.sort((a, b) => {
+    const da = Math.abs(a.midpoint - fib.half);
+    const db = Math.abs(b.midpoint - fib.half);
+    if (da !== db) return da - db;
+    return Math.abs(a.midpoint - currentPrice) - Math.abs(b.midpoint - currentPrice);
+  });
+
+  return approached[0];
+}
+
+
+// ============================================================
+// MSS + TWO SUCCESSIVE STRUCTURE
+// ============================================================
+
+function hasMSSAndTwoSuccessiveStructure(h1Swings, structure) {
+  if (!h1Swings || h1Swings.length < 10) return false;
+
+  const highs = h1Swings.filter(s => s.type === 'high');
+  const lows  = h1Swings.filter(s => s.type === 'low');
+
+  if (highs.length < 5 || lows.length < 5) return false;
+
+  if (structure === 'up') {
+    let mssIndex = -1;
+    for (let i = 2; i < highs.length; i++) {
+      const makingLowerHighs = highs[i - 1].price < highs[i - 2].price;
+      const bullishBreak = highs[i].price > highs[i - 1].price;
+      if (makingLowerHighs && bullishBreak) mssIndex = i;
+    }
+    if (mssIndex < 0) return false;
+
+    const postHighs = highs.slice(mssIndex);
+    const mssTime = highs[mssIndex].index;
+    const postLows = lows.filter(l => l.index > mssTime);
+
+    if (postHighs.length < 3 || postLows.length < 2) return false;
+
+    const hh1 = postHighs[1].price > postHighs[0].price;
+    const hh2 = postHighs[2].price > postHighs[1].price;
+
+    const firstPostLowIdx = lows.findIndex(l => l.index > mssTime);
+    if (firstPostLowIdx <= 0) return false;
+
+    const prevLow = lows[firstPostLowIdx - 1];
+    const hl1 = postLows[0].price > prevLow.price;
+    const hl2 = postLows[1].price > postLows[0].price;
+
+    return hh1 && hh2 && hl1 && hl2;
+  }
+
+  if (structure === 'down') {
+    let mssIndex = -1;
+    for (let i = 2; i < lows.length; i++) {
+      const makingHigherLows = lows[i - 1].price > lows[i - 2].price;
+      const bearishBreak = lows[i].price < lows[i - 1].price;
+      if (makingHigherLows && bearishBreak) mssIndex = i;
+    }
+    if (mssIndex < 0) return false;
+
+    const postLows = lows.slice(mssIndex);
+    const mssTime = lows[mssIndex].index;
+    const postHighs = highs.filter(h => h.index > mssTime);
+
+    if (postLows.length < 3 || postHighs.length < 2) return false;
+
+    const ll1 = postLows[1].price < postLows[0].price;
+    const ll2 = postLows[2].price < postLows[1].price;
+
+    const firstPostHighIdx = highs.findIndex(h => h.index > mssTime);
+    if (firstPostHighIdx <= 0) return false;
+
+    const prevHigh = highs[firstPostHighIdx - 1];
+    const lh1 = postHighs[0].price < prevHigh.price;
+    const lh2 = postHighs[1].price < postHighs[0].price;
+
+    return ll1 && ll2 && lh1 && lh2;
+  }
+
+  return false;
+}
+
+
+// ============================================================
+// FIND ORIGINATING S/R + SETUP B + SETUP A
+// ============================================================
+
+function findDailySRThatOriginatedTheMove(zones, currentPrice, fib, structure) {
+  if (!zones.length) return null;
+
+  const directional = zones.filter(zone => {
+    return structure === 'up'
+      ? zone.midpoint <= currentPrice
+      : zone.midpoint >= currentPrice;
+  });
+
+  if (!directional.length) return null;
+
+  directional.sort((a, b) =>
+    Math.abs(currentPrice - a.midpoint) - Math.abs(currentPrice - b.midpoint)
+  );
+
+  return directional[0];
+}
+
+function setupBEntry(currentBar, srZone, fib, structure, h1Swings) {
+  if (!srZone || !fib) return null;
+  if (!hasMSSAndTwoSuccessiveStructure(h1Swings, structure)) return null;
+
+  const entry = fib.half;
+  const side = structure === 'up' ? 'long' : 'short';
+
+  if (side === 'long' && currentBar.o < entry && currentBar.h >= entry) {
+    return { entry, side };
+  }
+  if (side === 'short' && currentBar.o > entry && currentBar.l <= entry) {
+    return { entry, side };
+  }
+  return null;
+}
+
+function evaluateSetupA(bar, price, srZone, fib, structure) {
+  if (!srZone || !fib) return null;
+
+  const pd = getPremiumDiscountRange(fib, structure);
+  if (srZone.midpoint < pd.low || srZone.midpoint > pd.high) return null;
+
+  const side = structure === 'up' ? 'long' : 'short';
+  const entry = srZone.midpoint;
+
+  if (isGapPastEntry(bar, entry, side)) return null;
+  if (!priceTouchesEntry(bar, entry, side)) return null;
+
+  return { entry, side };
+}
+
+
+// ============================================================
+// PERFORMANCE HELPERS
+// ============================================================
+
+function calculateStats(trades, startingCapital = INITIAL_CAPITAL) {
+  if (!trades || trades.length === 0) {
+    return {
+      totalTrades: 0, wins: 0, losses: 0, winRate: 0,
+      netProfit: 0, profitFactor: 0, expectancy: 0,
+      maxDrawdown: 0, maxLosingStreak: 0, averageR: 0,
+      endingCapital: startingCapital
+    };
+  }
+
+  const wins = trades.filter(t => t.pnl > 0);
+  const losses = trades.filter(t => t.pnl <= 0);
+
+  const totalPnL = trades.reduce((sum, t) => sum + t.pnl, 0);
+  const grossProfit = wins.reduce((sum, t) => sum + t.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((sum, t) => sum + t.pnl, 0));
+
+  const winRate = (wins.length / trades.length) * 100;
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : Infinity;
+
+  const avgWin = wins.length ? grossProfit / wins.length : 0;
+  const avgLoss = losses.length ? -(grossLoss / losses.length) : 0;
+  const expectancy = (wins.length / trades.length) * avgWin + (losses.length / trades.length) * avgLoss;
+  const averageR = totalPnL / (trades.length * FIXED_RISK_USD);
+
+  let equity = startingCapital;
+  let peak = startingCapital;
+  let maxDrawdown = 0;
+  let currentStreak = 0;
+  let maxLosingStreak = 0;
+
+  for (const t of trades) {
+    equity += t.pnl;
+    if (equity > peak) peak = equity;
+    const dd = peak - equity;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+
+    if (t.pnl <= 0) {
+      currentStreak++;
+      if (currentStreak > maxLosingStreak) maxLosingStreak = currentStreak;
+    } else {
+      currentStreak = 0;
+    }
+  }
+
+  return {
+    totalTrades: trades.length,
+    wins: wins.length,
+    losses: losses.length,
+    winRate,
+    netProfit: totalPnL,
+    profitFactor,
+    expectancy,
+    maxDrawdown,
+    maxLosingStreak,
+    averageR,
+    endingCapital: equity
+  };
+}
+
+function printStats(title, stats) {
+  console.log(`\n----- ${title} -----`);
+  console.log(`Total Trades        : ${stats.totalTrades}`);
+  console.log(`Wins / Losses       : ${stats.wins} / ${stats.losses}`);
+  console.log(`Win Rate            : ${stats.winRate.toFixed(1)}%`);
+  console.log(`Net Profit          : $${stats.netProfit.toFixed(2)}`);
+  console.log(`Profit Factor       : ${stats.profitFactor === Infinity ? '∞' : stats.profitFactor.toFixed(2)}`);
+  console.log(`Expectancy / Trade  : $${stats.expectancy.toFixed(2)}`);
+  console.log(`Maximum Drawdown    : $${stats.maxDrawdown.toFixed(2)}`);
+  console.log(`Max Losing Streak   : ${stats.maxLosingStreak}`);
+  console.log(`Average R           : ${stats.averageR.toFixed(2)}R`);
+  console.log(`Ending Capital      : $${stats.endingCapital.toFixed(2)}`);
+}
+
+function getYear(timestamp) {
+  return new Date(timestamp).getUTCFullYear();
+}
+
+
+// ============================================================
+// BACKTEST (with zone caching)
+// ============================================================
+
+function runBacktest(instrument) {
+  console.log(`\n========== ${instrument} ==========`);
+
+  const rules = INSTRUMENT_RULES[instrument];
+  if (!rules) throw new Error(`No rules configured for ${instrument}`);
+
+  const h1Path = path.join(__dirname, `${instrument.toLowerCase()}_1h.csv`);
+  const d1Path = path.join(__dirname, `${instrument.toLowerCase()}_1d.csv`);
+
+  const h1All = loadCSV(h1Path);
+  const d1All = loadCSV(d1Path);
+
+  const startMs = new Date(START_DATE).getTime();
+  const endMs   = new Date(END_DATE).getTime();
+
+  const h1 = h1All.filter(b => b.t >= startMs && b.t <= endMs);
+
+  if (h1.length < 200) {
+    console.error('Not enough 1H data');
+    return [];
+  }
+
+  let capital = INITIAL_CAPITAL;
+  let position = null;
+  const trades = [];
+  let setupBState = null;
+
+  // ---------- ZONE CACHE ----------
+  let cachedZones = null;
+  let lastCachedDay = null;
+
+  for (let i = 0; i < h1.length; i++) {
+    const bar = h1[i];
+    const price = bar.c;
+
+    const h1IndexInAll = h1All.findIndex(b => b.t === bar.t);
+    if (h1IndexInAll < 0) continue;
+
+    // Exit logic
+    if (position) {
+      let closed = false;
+      let pnl = 0;
+      let exitReason = null;
+
+      if (position.side === 'long') {
+        if (bar.l <= position.sl) {
+          pnl = -FIXED_RISK_USD;
+          closed = true;
+          exitReason = 'SL';
+        } else if (bar.h >= position.tp) {
+          pnl = FIXED_RISK_USD * RR;
+          closed = true;
+          exitReason = 'TP';
+        }
+      } else {
+        if (bar.h >= position.sl) {
+          pnl = -FIXED_RISK_USD;
+          closed = true;
+          exitReason = 'SL';
+        } else if (bar.l <= position.tp) {
+          pnl = FIXED_RISK_USD * RR;
+          closed = true;
+          exitReason = 'TP';
+        }
+      }
+
+      if (closed) {
+        capital += pnl;
+        trades.push({
+          ...position,
+          instrument,
+          exitTime: bar.t,
+          exitReason,
+          pnl,
+          capitalAfter: capital
+        });
+        position = null;
+      }
+    }
+
+    if (position) continue;
+    if (isMajorNewsWindow(bar.t)) continue;
+
+    // ---------- CACHED DAILY ZONES ----------
+    const currentDay = utcDayStart(bar.t);
+
+    if (cachedZones === null || currentDay > lastCachedDay) {
+      cachedZones = getActiveDailySRZones(d1All, bar.t, rules);
+      lastCachedDay = currentDay;
+    }
+
+    const dailyZones = cachedZones;
+    if (!dailyZones.length) continue;
+
+    // Structure + Fib
+    const h1Swings = getConfirmedH1Swings(h1All, h1IndexInAll);
+    const structure = getMarketStructure(h1Swings);
+    if (structure === 'range') continue;
+
+    const fib = getFibonacci(h1Swings, structure);
+    if (!fib) continue;
+
+    // Setup A
+    const setupAZone = findNearestQualifyingSR(dailyZones, price, bar, fib, structure);
+    const setupA = evaluateSetupA(bar, price, setupAZone, fib, structure);
+
+    if (setupA) {
+      position = makePosition({
+        side: setupA.side,
+        entry: setupA.entry,
+        srZone: setupAZone,
+        setup: 'A',
+        structure,
+        fib,
+        entryTime: bar.t
+      });
+      setupBState = null;
+      continue;
+    }
+
+    // Setup B
+    const targetSRs = getQualifyingSRInTargetZone(dailyZones, fib, structure);
+
+    const originZone = targetSRs.length === 0
+      ? findDailySRThatOriginatedTheMove(dailyZones, price, fib, structure)
+      : null;
+
+    if (originZone) {
+      if (
+        !setupBState ||
+        setupBState.zone.midpoint !== originZone.midpoint ||
+        setupBState.structure !== structure
+      ) {
+        setupBState = {
+          zone: originZone,
+          structure,
+          firstSeenTime: bar.t
+        };
+      }
+    }
+
+    if (setupBState && setupBState.structure === structure) {
+      const setupB = setupBEntry(bar, setupBState.zone, fib, structure, h1Swings);
+
+      if (setupB) {
+        if (
+          !isGapPastEntry(bar, setupB.entry, setupB.side) &&
+          priceTouchesEntry(bar, setupB.entry, setupB.side)
+        ) {
+          position = makePosition({
+            side: setupB.side,
+            entry: setupB.entry,
+            srZone: setupBState.zone,
+            setup: 'B',
+            structure,
+            fib,
+            entryTime: bar.t
+          });
+          setupBState = null;
+        }
+      }
+    }
+  }
+
+  // Results
+  const stats = calculateStats(trades);
+  printStats(`${instrument} - OVERALL`, stats);
+
+  printStats(`${instrument} - SETUP A`, calculateStats(trades.filter(t => t.setup === 'A')));
+  printStats(`${instrument} - SETUP B`, calculateStats(trades.filter(t => t.setup === 'B')));
+
+  const years = {};
+  for (const t of trades) {
+    const y = getYear(t.entryTime);
+    if (!years[y]) years[y] = [];
+    years[y].push(t);
+  }
+
+  console.log(`\n----- ${instrument} - RESULTS BY YEAR -----`);
+  Object.keys(years).sort().forEach(year => {
+    const yearStats = calculateStats(years[year]);
+    console.log(`\nYear ${year}:`);
+    console.log(`  Trades       : ${yearStats.totalTrades}`);
+    console.log(`  Win Rate     : ${yearStats.winRate.toFixed(1)}%`);
+    console.log(`  Net Profit   : $${yearStats.netProfit.toFixed(2)}`);
+    console.log(`  Profit Factor: ${yearStats.profitFactor === Infinity ? '∞' : yearStats.profitFactor.toFixed(2)}`);
+    console.log(`  Max DD       : $${yearStats.maxDrawdown.toFixed(2)}`);
+  });
+
+  return trades;
+}
+
+
+// ============================================================
+// START
+// ============================================================
+
+console.log('ICT-Reverse Backtester v2 starting...\n');
+
+const allTrades = [];
+
+INSTRUMENTS.forEach(instrument => {
+  const instrumentTrades = runBacktest(instrument);
+  allTrades.push(...instrumentTrades);
+});
+
+
+// ============================================================
+// COMBINED SUMMARY
+// ============================================================
+
+console.log('\n\n=====================================================');
+console.log('                 COMBINED SUMMARY');
+console.log('=====================================================');
+
+printStats('ALL INSTRUMENTS COMBINED', calculateStats(allTrades));
+printStats('ALL - SETUP A', calculateStats(allTrades.filter(t => t.setup === 'A')));
+printStats('ALL - SETUP B', calculateStats(allTrades.filter(t => t.setup === 'B')));
+printStats('NASDAQ ONLY', calculateStats(allTrades.filter(t => t.instrument === 'NASDAQ')));
+printStats('US30 ONLY', calculateStats(allTrades.filter(t => t.instrument === 'US30')));
+
+const combinedYears = {};
+for (const t of allTrades) {
+  const y = getYear(t.entryTime);
+  if (!combinedYears[y]) combinedYears[y] = [];
+  combinedYears[y].push(t);
+}
+
+console.log('\n----- COMBINED RESULTS BY YEAR -----');
+Object.keys(combinedYears).sort().forEach(year => {
+  const yearStats = calculateStats(combinedYears[year]);
+  console.log(`\nYear ${year}:`);
+  console.log(`  Trades         : ${yearStats.totalTrades}`);
+  console.log(`  Wins/Losses    : ${yearStats.wins} / ${yearStats.losses}`);
+  console.log(`  Win Rate       : ${yearStats.winRate.toFixed(1)}%`);
+  console.log(`  Net Profit     : $${yearStats.netProfit.toFixed(2)}`);
+  console.log(`  Profit Factor  : ${yearStats.profitFactor === Infinity ? '∞' : yearStats.profitFactor.toFixed(2)}`);
+  console.log(`  Expectancy     : $${yearStats.expectancy.toFixed(2)}`);
+  console.log(`  Max DD         : $${yearStats.maxDrawdown.toFixed(2)}`);
+  console.log(`  Max Lose Streak: ${yearStats.maxLosingStreak}`);
+});
+
+console.log('\nDone.');
+```
